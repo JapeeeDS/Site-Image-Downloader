@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Image Downloader — Per Page Folders</title>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<style>
+  :root{--bg:#0b1020;--fg:#e6e9f2;--mut:#8a93a6;--acc:#6ea8fe;--card:#121933;--ok:#22c55e;--err:#ef4444}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:linear-gradient(180deg,#0b1020,#0e1430);color:var(--fg);min-height:100vh}
+  .wrap{max-width:880px;margin:0 auto;padding:32px 20px 80px}
+  h1{font-size:28px;margin:0 0 6px}
+  p.lead{color:var(--mut);margin:0 0 24px}
+  .card{background:var(--card);border:1px solid #1f2a52;border-radius:14px;padding:18px;margin-bottom:16px}
+  label{display:block;font-size:13px;color:var(--mut);margin-bottom:6px}
+  textarea,input{width:100%;background:#0c1330;color:var(--fg);border:1px solid #243066;border-radius:10px;padding:12px;font-family:inherit;font-size:14px}
+  textarea{min-height:96px;resize:vertical}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:10px}
+  .row label{display:flex;align-items:center;gap:6px;color:var(--fg);font-size:13px;margin:0}
+  button{background:var(--acc);color:#0b1020;border:0;border-radius:10px;padding:12px 18px;font-weight:600;cursor:pointer}
+  button:disabled{opacity:.6;cursor:not-allowed}
+  button.ghost{background:transparent;color:var(--fg);border:1px solid #243066}
+  .log{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:#070b1d;border:1px solid #1c2654;border-radius:10px;padding:12px;max-height:280px;overflow:auto;white-space:pre-wrap}
+  .ok{color:var(--ok)} .err{color:var(--err)} .mut{color:var(--mut)}
+  .bar{height:8px;background:#0c1330;border-radius:99px;overflow:hidden;border:1px solid #243066}
+  .bar>span{display:block;height:100%;background:var(--acc);width:0;transition:width .2s}
+  small.hint{color:var(--mut)}
+  a.dl{display:inline-block;margin-top:10px;color:var(--acc)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🖼️ Image Downloader</h1>
+  <p class="lead">Ilagay ang URLs ng mga pages. I-fetch nito lahat ng images at i-zip per page (one folder per page).</p>
+
+  <div class="card">
+    <label for="urls">Page URLs (isa kada linya)</label>
+    <textarea id="urls" placeholder="https://example.com/page1&#10;https://example.com/page2"></textarea>
+    <div class="row">
+      <label for="proxy">CORS proxy:</label>
+      <input id="proxy" style="flex:1;min-width:260px" value="https://api.allorigins.win/raw?url="/>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="incBg" checked> Include CSS background images</label>
+      <label><input type="checkbox" id="incSrcset" checked> Largest from srcset</label>
+      <label>Min size (KB) <input id="minKb" type="number" value="0" style="width:80px"/></label>
+    </div>
+    <div class="row">
+      <button id="go">Download as ZIP</button>
+      <button id="clear" class="ghost">Clear log</button>
+      <small class="hint">Note: Bound by website CORS. Yung proxy ay para sa HTML fetch lang; images ay didirect-fetched.</small>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between"><strong>Progress</strong><span id="pct" class="mut">0%</span></div>
+    <div class="bar"><span id="bar"></span></div>
+    <div id="dlLink"></div>
+  </div>
+
+  <div class="card">
+    <strong>Log</strong>
+    <div id="log" class="log mut">Ready.</div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const logEl = $('log'), barEl = $('bar'), pctEl = $('pct');
+function log(msg, cls=''){ const d=document.createElement('div'); if(cls)d.className=cls; d.textContent=msg; logEl.appendChild(d); logEl.scrollTop=logEl.scrollHeight; }
+function setPct(p){ barEl.style.width=p+'%'; pctEl.textContent=Math.round(p)+'%'; }
+
+function slugify(s){ return (s||'page').replace(/^https?:\/\//,'').replace(/[^\w.-]+/g,'_').replace(/_+/g,'_').slice(0,80) || 'page'; }
+function extFromUrl(u){ try{ const p=new URL(u).pathname; const m=p.match(/\.(jpe?g|png|gif|webp|svg|avif|bmp|ico)(\?|$)/i); return m?m[1].toLowerCase():'img'; }catch{return 'img'} }
+function filename(u, i){ try{ const p=new URL(u).pathname.split('/').pop()||('image_'+i); return p.split('?')[0] || ('image_'+i+'.'+extFromUrl(u)); }catch{return 'image_'+i+'.'+extFromUrl(u)} }
+
+function pickFromSrcset(srcset){
+  if(!srcset) return null;
+  const parts=srcset.split(',').map(s=>s.trim()).map(s=>{const [u,w]=s.split(/\s+/);return {u,w:parseInt(w)||0}});
+  parts.sort((a,b)=>b.w-a.w);
+  return parts[0]?.u || null;
+}
+
+function extractImages(html, baseUrl, opts){
+  const doc = new DOMParser().parseFromString(html,'text/html');
+  const base = doc.createElement('base'); base.href = baseUrl;
+  doc.head.prepend(base);
+  const urls = new Set();
+  doc.querySelectorAll('img').forEach(img=>{
+    let u = img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src') || img.getAttribute('data-original');
+    if(opts.incSrcset){
+      const ss = pickFromSrcset(img.getAttribute('srcset') || img.getAttribute('data-srcset'));
+      if(ss) u = ss;
+    }
+    if(u) try{ urls.add(new URL(u, baseUrl).href) }catch{}
+  });
+  doc.querySelectorAll('source[srcset]').forEach(s=>{
+    const u = pickFromSrcset(s.getAttribute('srcset'));
+    if(u) try{ urls.add(new URL(u, baseUrl).href) }catch{}
+  });
+  doc.querySelectorAll('a').forEach(a=>{
+    const h=a.getAttribute('href')||'';
+    if(/\.(jpe?g|png|gif|webp|svg|avif)(\?|$)/i.test(h)){ try{ urls.add(new URL(h,baseUrl).href) }catch{} }
+  });
+  if(opts.incBg){
+    doc.querySelectorAll('[style]').forEach(el=>{
+      const m=(el.getAttribute('style')||'').match(/url\((['"]?)(.+?)\1\)/gi);
+      if(m) m.forEach(x=>{ const u=x.replace(/url\((['"]?)(.+?)\1\)/i,'$2'); try{ urls.add(new URL(u,baseUrl).href) }catch{} });
+    });
+    doc.querySelectorAll('style').forEach(st=>{
+      const re=/url\((['"]?)(.+?)\1\)/gi; let m;
+      while((m=re.exec(st.textContent||''))){ try{ urls.add(new URL(m[2],baseUrl).href) }catch{} }
+    });
+  }
+  return [...urls].filter(u=>/^https?:/.test(u));
+}
+
+async function fetchHtml(url, proxy){
+  const target = proxy ? (proxy + encodeURIComponent(url)) : url;
+  const r = await fetch(target);
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  return await r.text();
+}
+
+async function fetchImage(url){
+  try{
+    const r = await fetch(url, {mode:'cors'});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return await r.blob();
+  }catch(e){
+    // fallback via proxy
+    const proxy = $('proxy').value.trim();
+    if(proxy){
+      const r2 = await fetch(proxy + encodeURIComponent(url));
+      if(!r2.ok) throw new Error('proxy HTTP '+r2.status);
+      return await r2.blob();
+    }
+    throw e;
+  }
+}
+
+$('clear').onclick = ()=>{ logEl.textContent=''; setPct(0); $('dlLink').innerHTML=''; };
+
+$('go').onclick = async ()=>{
+  const urls = $('urls').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  if(!urls.length){ log('Walang URL.','err'); return; }
+  const proxy = $('proxy').value.trim();
+  const opts = { incBg:$('incBg').checked, incSrcset:$('incSrcset').checked };
+  const minBytes = (parseInt($('minKb').value)||0)*1024;
+  $('go').disabled=true; $('dlLink').innerHTML=''; setPct(0);
+  const zip = new JSZip();
+  let totalImgs = 0, doneImgs = 0, totalPlanned = 0;
+  const pagePlans = [];
+
+  for(const url of urls){
+    log('→ Fetching page: '+url);
+    try{
+      const html = await fetchHtml(url, proxy);
+      const imgs = extractImages(html, url, opts);
+      log('  found '+imgs.length+' images', 'ok');
+      pagePlans.push({url, imgs});
+      totalPlanned += imgs.length;
+    }catch(e){
+      log('  failed: '+e.message,'err');
+      pagePlans.push({url, imgs:[]});
+    }
+  }
+  if(totalPlanned===0){ log('Walang images na nakuha.','err'); $('go').disabled=false; return; }
+
+  for(const {url, imgs} of pagePlans){
+    const folder = zip.folder(slugify(url));
+    const seen = new Set();
+    let idx=0;
+    for(const u of imgs){
+      idx++;
+      try{
+        const blob = await fetchImage(u);
+        if(blob.size < minBytes){ log('  skip (small): '+u,'mut'); doneImgs++; setPct(doneImgs/totalPlanned*100); continue; }
+        let name = filename(u, idx);
+        while(seen.has(name)) name = idx+'_'+name;
+        seen.add(name);
+        folder.file(name, blob);
+        totalImgs++;
+      }catch(e){
+        log('  img fail: '+u+' ('+e.message+')','err');
+      }
+      doneImgs++;
+      setPct(doneImgs/totalPlanned*100);
+    }
+    folder.file('_source.txt', 'Source page: '+url+'\nImages saved: '+seen.size+'\n');
+  }
+
+  log('Building zip…');
+  const blob = await zip.generateAsync({type:'blob'}, m=>setPct(m.percent));
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'images_'+Date.now()+'.zip';
+  a.textContent = '⬇ Download ZIP ('+totalImgs+' images)';
+  a.className='dl';
+  $('dlLink').innerHTML=''; $('dlLink').appendChild(a);
+  log('Done. '+totalImgs+' images saved.','ok');
+  $('go').disabled=false;
+};
+</script>
+</body>
+</html>
